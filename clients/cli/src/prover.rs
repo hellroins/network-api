@@ -2,23 +2,37 @@
 
 mod analytics;
 mod config;
+mod connection;
 mod generated;
+mod prover_id_manager;
+mod updater;
+pub mod utils;
+mod websocket;
 
 use crate::analytics::track;
 
 use std::borrow::Cow;
 
-use clap::Parser;
-use futures::{SinkExt, StreamExt};
-use generated::pb::{
-    self, compiled_program::Program, proof, prover_request, vm_program_input::Input, Progress,
-    ProverRequest, ProverRequestRegistration, ProverResponse, ProverType,
+use crate::connection::{
+    connect_to_orchestrator_with_infinite_retry, connect_to_orchestrator_with_limited_retry,
 };
+
+use clap::Parser;
+use colored::Colorize;
+use futures::{SinkExt, StreamExt};
+
+use generated::pb::ClientProgramProofRequest;
 use prost::Message as _;
-use random_word::Lang;
 use serde_json::json;
-use std::{fs, path::Path, time::SystemTime};
-use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Message};
+use std::time::Instant;
+// Network connection types for WebSocket communication
+
+// WebSocket protocol types for message handling
+use tokio_tungstenite::tungstenite::protocol::{
+    frame::coding::CloseCode, // Status codes for connection closure (e.g., 1000 for normal)
+    CloseFrame,               // Frame sent when closing connection (includes code and reason)
+    Message,                  // Different types of WebSocket messages (Binary, Text, Ping, etc.)
+};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
@@ -32,8 +46,15 @@ use nexus_core::{
         init_circuit_trace, key::CanonicalSerialize, pp::gen_vm_pp, prove_seq_step, types::*,
     },
 };
+use std::fs;
+use std::fs::File;
+use std::io::Read;
 use zstd::stream::Encoder;
-use rand::{ RngCore };
+
+use crate::utils::updater::AutoUpdaterMode;
+
+// The interval at which to send updates to the orchestrator
+const PROOF_PROGRESS_UPDATE_INTERVAL_IN_SECONDS: u64 = 180; // 3 minutes
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -47,10 +68,31 @@ struct Args {
     /// Whether to hang up after the first proof
     #[arg(short, long, default_value_t = false)]
     just_once: bool,
+
+    /// Mode for the auto updater (production/test)
+    #[arg(short, long, value_enum, default_value_t = AutoUpdaterMode::Production)]
+    updater_mode: AutoUpdaterMode,
+}
+
+fn get_file_as_byte_vec(filename: &str) -> Vec<u8> {
+    let mut f = File::open(filename).expect("no file found");
+    let metadata = fs::metadata(filename).expect("unable to read metadata");
+    let mut buffer = vec![0; metadata.len() as usize];
+    f.read_exact(&mut buffer).expect("buffer overflow");
+
+    buffer
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Print the banner at startup
+    utils::cli_branding::print_banner();
+
+    println!(
+        "\n===== {}...\n",
+        "Setting up CLI configuration".bold().underline()
+    );
+
     // Configure the tracing subscriber
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -71,116 +113,64 @@ async fn main() {
     let pp = gen_vm_pp::<C1, seq::SetupParams<(G1, G2, C1, C2, RO, SC)>>(k as usize, &())
         .expect("error generating public parameters");
 
-    // If the prover_id file is found, use the contents, otherwise generate a new random id
-    // and store it.
-    let mut prover_id = format!(
-        "{}-{}-{}",
-        random_word::gen(Lang::En),
-        random_word::gen(Lang::En),
-        rand::thread_rng().next_u32() % 100,
+    // get or generate the prover id
+    let prover_id = prover_id_manager::get_or_generate_prover_id();
+
+    println!(
+        "\n\t✔ Your current prover identifier is {}",
+        prover_id.bright_cyan()
     );
-    match home::home_dir() {
-        Some(path) if !path.as_os_str().is_empty() => {
-            let nexus_dir = Path::new(&path).join(".nexus");
-            prover_id = match fs::read(nexus_dir.join("prover-id")) {
-                Ok(buf) => String::from_utf8(buf).unwrap(),
-                Err(_) => {
-                    let _ = fs::create_dir(nexus_dir.clone());
-                    fs::write(nexus_dir.join("prover-id"), prover_id.clone()).unwrap();
-                    prover_id
-                }
-            }
-        }
-        _ => {
-            println!("Unable to get home dir.");
-        }
-    };
+
+    println!(
+        "\n===== {}...\n",
+        "Connecting to Nexus Network".bold().underline()
+    );
 
     track(
         "connect".into(),
         format!("Connecting to {}...", &ws_addr_string),
         &ws_addr_string,
         json!({"prover_id": prover_id}),
+        false,
     );
 
-    let (mut client, _) = tokio_tungstenite::connect_async(&ws_addr_string)
-        .await
-        .unwrap();
+    // Connect to the Orchestrator with exponential backoff
+    let mut client = connect_to_orchestrator_with_infinite_retry(&ws_addr_string, &prover_id).await;
 
-    track(
-        "connected".into(),
-        "Connected.".into(),
-        &ws_addr_string,
-        json!({"prover_id": prover_id}),
+    println!(
+        "\n{}",
+        "Success! Connection complete!\n".green().bold().underline()
     );
-
-    let registration = ProverRequest {
-        contents: Some(prover_request::Contents::Registration(
-            ProverRequestRegistration {
-                prover_type: ProverType::Volunteer.into(),
-                prover_id: prover_id.clone().into(),
-                estimated_proof_cycles_hertz: None,
-            },
-        )),
-    };
-
-    let mut retries = 0;
-    let max_retries = 5;
-
-    loop {
-        if let Err(e) = client.send(Message::Binary(registration.encode_to_vec())).await {
-            eprintln!("Failed to send message: {:?}, attempt {}/{}", e, retries + 1, max_retries);
-
-            retries += 1;
-            if retries >= max_retries {
-                eprintln!("Max retries reached, exiting...");
-                break;
-            }
-
-            // Add a delay before retrying
-            tokio::time::sleep(tokio::time::Duration::from_secs(u64::pow(2, retries))).await;
-        } else {
-            break;
-        }
-    }
 
     track(
         "register".into(),
-        format!("Your assigned prover identifier is {}.", prover_id),
+        format!("Your current prover identifier is {}.", prover_id),
         &ws_addr_string,
         json!({"ws_addr_string": ws_addr_string, "prover_id": prover_id}),
+        false,
     );
+
+    let mut queued_proof_duration_millis = 0;
+    let mut queued_steps_proven: i32 = 0;
+    let mut timer_since_last_orchestrator_update = Instant::now();
+
+    println!(
+        "\n===== {}...\n",
+        "Starting proof generation for programs".bold().underline()
+    );
+
     loop {
-        let program_message = match client.next().await.unwrap().unwrap() {
-            Message::Binary(b) => b,
-            _ => panic!("Unexpected message type"),
-        };
-        let program = ProverResponse::decode(program_message.as_slice()).unwrap();
+        // Create the inputs for the program
+        use rand::Rng; // Required for .gen() methods
+        let mut rng = rand::thread_rng();
+        let input = vec![5, rng.gen::<u8>(), rng.gen::<u8>()];
 
-        let Program::Rv32iElfBytes(elf_bytes) = program
-            .to_prove
-            .clone()
-            .unwrap()
-            .program
-            .unwrap()
-            .program
-            .unwrap();
-        let to_prove = program.to_prove.unwrap();
-        let Input::RawBytes(input) = to_prove.input.unwrap().input.unwrap();
-
-        track(
-            "program".into(),
-            format!(
-                "Received a {} byte program to prove with {} bytes of input",
-                elf_bytes.len(),
-                input.len()
-            ),
-            &ws_addr_string,
-            json!({"prover_id": prover_id}),
-        );
+        let program_name = utils::prover::get_program_for_prover(&prover_id);
+        let program_file_path = &format!("src/generated/{}", program_name);
 
         let mut vm: NexusVM<MerkleTrie> =
-            parse_elf(&elf_bytes.as_ref()).expect("error loading and parsing RISC-V instruction");
+            parse_elf(get_file_as_byte_vec(program_file_path).as_ref())
+                .expect("error loading and parsing RISC-V instruction");
         vm.syscalls.set_input(&input);
 
         // TODO(collinjackson): Get outputs
@@ -188,106 +178,145 @@ async fn main() {
         let tr = init_circuit_trace(completed_trace).expect("error initializing circuit trace");
 
         let total_steps = tr.steps();
-        let start: usize = match to_prove.step_to_start {
-            Some(step) => step as usize,
-            None => 0,
-        };
-        let steps_to_prove = match to_prove.steps_to_prove {
-            Some(steps) => steps as usize,
-            None => total_steps,
-        };
+        let start = 0;
+        let steps_to_prove = 10;
         let mut end: usize = start + steps_to_prove;
         if end > total_steps {
             end = total_steps
         }
 
-        let initial_progress = ProverRequest {
-            contents: Some(prover_request::Contents::Progress(Progress {
-                completed_fraction: 0.0,
-                steps_in_trace: total_steps as i32,
-                steps_to_prove: (end - start) as i32,
-                steps_proven: 0,
-            })),
-        };
-        client
-            .send(Message::Binary(initial_progress.encode_to_vec()))
-            .await
-            .unwrap();
-
         let z_st = tr.input(start).expect("error starting circuit trace");
         let mut proof = IVCProof::new(&z_st);
 
-        let mut completed_fraction = 0.0;
         let mut steps_proven = 0;
-        track(
-            "progress".into(),
-            format!(
-                "Program trace is {} steps. Proving {} steps starting at {}...",
-                total_steps, steps_to_prove, start
-            ),
-            &ws_addr_string,
-            json!({
-                "completed_fraction": completed_fraction,
-                "steps_in_trace": total_steps,
-                "steps_to_prove": steps_to_prove,
-                "steps_proven": steps_proven,
-                "cycles_proven": steps_proven * k,
-                "k": k,
-                "prover_id": prover_id,
-            }),
+
+        println!(
+            "Program trace is {} steps. Proving {} steps starting at {}...",
+            total_steps, steps_to_prove, start
         );
-        let start_time = SystemTime::now();
+
+        let start_time = Instant::now();
         let mut progress_time = start_time;
         for step in start..end {
             proof = prove_seq_step(Some(proof), &pp, &tr).expect("error proving step");
             steps_proven += 1;
-            completed_fraction = steps_proven as f32 / steps_to_prove as f32;
-            let progress = ProverRequest {
-                contents: Some(prover_request::Contents::Progress(Progress {
-                    completed_fraction: completed_fraction,
-                    steps_in_trace: total_steps as i32,
-                    steps_to_prove: steps_to_prove as i32,
-                    steps_proven: steps_proven as i32,
-                })),
-            };
-            let progress_duration = SystemTime::now().duration_since(progress_time).unwrap();
-            let cycles_proven = steps_proven * 4;
-            let proof_cycles_hertz = k as f64 * 1000.0 / progress_duration.as_millis() as f64;
-            track(
-                "progress".into(),
-                format!("Proved step {} at {:.2} proof cycles/sec.", step, proof_cycles_hertz),
-                &ws_addr_string,
-                json!({
-                    "completed_fraction": completed_fraction,
-                    "steps_in_trace": total_steps,
-                    "steps_to_prove": steps_to_prove,
-                    "steps_proven": steps_proven,
-                    "cycles_proven": steps_proven * 4,
-                    "k": k,
-                    "progress_duration_millis": progress_duration.as_millis(),
-                    "proof_cycles_hertz": proof_cycles_hertz,
-                    "prover_id": prover_id,
-                }),
-            );
-            progress_time = SystemTime::now();
 
-            let mut retries = 0;
-            let max_retries = 5;
-            loop {
-                if let Err(e) = client.send(Message::Binary(progress.encode_to_vec())).await {
-                    eprintln!("Failed to send message: {:?}, attempt {}/{}", e, retries + 1, max_retries);
-        
-                    retries += 1;
-                    if retries >= max_retries {
-                        eprintln!("Max retries reached, exiting...");
-                        break;
+            let progress_duration = progress_time.elapsed();
+            let proof_cycles_hertz = k as f64 * 1000.0 / progress_duration.as_millis() as f64;
+
+            //update the queued variables
+            queued_proof_duration_millis += progress_duration.as_millis() as i32;
+            queued_steps_proven += steps_proven;
+
+            let progress = ClientProgramProofRequest {
+                steps_in_trace: total_steps as i32,
+                steps_proven: queued_steps_proven,
+                step_to_start: start as i32,
+                program_id: program_name.clone(),
+                client_id_token: None,
+                proof_duration_millis: queued_proof_duration_millis,
+                k,
+                cli_prover_id: Some(prover_id.clone()),
+            };
+
+            // Print the proof progress in green or blue depending on the step number
+            println!(
+                "\t✓ Proved step {} at {:.2} proof cycles/sec.",
+                step, proof_cycles_hertz
+            );
+
+            progress_time = Instant::now();
+
+            //If it has been three minutes since the last orchestrator update, send the orchestator the update
+            if timer_since_last_orchestrator_update.elapsed().as_secs()
+                > PROOF_PROGRESS_UPDATE_INTERVAL_IN_SECONDS
+            {
+                println!(
+                    "\tWill try sending update to orchestrator with interval queued_steps_proven: {}",
+                    queued_steps_proven
+                );
+
+                // Send ping to the websocket connection and wait for pong
+                match client.send(Message::Ping(vec![])).await {
+                    //The ping was succesfully sent...
+                    Ok(_) => {
+                        //...wait for pong response from websocket with timeout...
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                            .await
+                        {
+                            //... and the pong was received
+                            Ok(Some(Ok(Message::Pong(_)))) => {
+                                // Connection is verified working
+                                match client.send(Message::Binary(progress.encode_to_vec())).await {
+                                    Ok(_) => {
+                                        // println!("\t\tSuccesfully sent progress to orchestrator\n");
+                                        // println!("{:#?}", progress);
+
+                                        // Reset the queued values only after successful send
+                                        queued_steps_proven = 0;
+                                        queued_proof_duration_millis = 0;
+                                    }
+                                    Err(_) => {
+                                        client = match connect_to_orchestrator_with_limited_retry(
+                                            &ws_addr_string,
+                                            &prover_id,
+                                        )
+                                        .await
+                                        {
+                                            Ok(new_client) => new_client,
+                                            Err(_) => {
+                                                // Continue using the existing client and try again next update
+                                                client
+                                            }
+                                        };
+
+                                        // Don't reset queued values on failure
+                                    }
+                                }
+                            }
+                            //... and the pong was not received
+                            _ => {
+                                // println!(
+                                //     "\t\tNo pong from websockets connection received. Will reconnect to orchestrator..."
+                                // );
+                                client = match connect_to_orchestrator_with_limited_retry(
+                                    &ws_addr_string,
+                                    &prover_id,
+                                )
+                                .await
+                                {
+                                    Ok(new_client) => new_client,
+                                    Err(_) => {
+                                        // Continue using the existing client and try again next update
+                                        client
+                                    }
+                                };
+                            }
+                        }
                     }
-        
-                    // Add a delay before retrying
-                    tokio::time::sleep(tokio::time::Duration::from_secs(u64::pow(2, retries))).await;
-                } else {
-                    break;
+                    //The ping failed to send...
+                    Err(_) => {
+                        // println!(
+                        //     "\t\tPing failed, will attempt to reconnect to orchestrator: {:?}",
+                        //     e
+                        // );
+                        client = match connect_to_orchestrator_with_limited_retry(
+                            &ws_addr_string,
+                            &prover_id,
+                        )
+                        .await
+                        {
+                            Ok(new_client) => new_client,
+                            Err(_) => {
+                                // Continue using the existing client and try again next update
+                                client
+                            }
+                        };
+                    }
                 }
+
+                //reset the timer regardless of success (to avoid spam)
+                timer_since_last_orchestrator_update = Instant::now()
             }
 
             if step == end - 1 {
@@ -299,27 +328,28 @@ async fn main() {
                     .expect("failed to compress proof");
                 encoder.finish().expect("failed to finish encoder");
 
-                let response = ProverRequest {
-                    contents: Some(prover_request::Contents::Proof(pb::Proof {
-                        proof: Some(proof::Proof::NovaBytes(buf)),
-                    })),
-                };
-                let duration = SystemTime::now().duration_since(start_time).unwrap();
-                let proof_cycles_hertz = cycles_proven as f64 * 1000.0 / duration.as_millis() as f64;
-                client
-                    .send(Message::Binary(response.encode_to_vec()))
-                    .await
-                    .unwrap();                                               
+                let total_duration = start_time.elapsed();
+                let total_minutes = total_duration.as_secs() as f64 / 60.0;
+                let cycles_proved = steps_proven * k;
+                let proof_cycles_per_minute = cycles_proved as f64 / total_minutes;
+
+                // Send analytics about the proof event
                 track(
                     "proof".into(),
-                    format!("Proof sent! Overall speed was {:.2} proof cycles/sec.", proof_cycles_hertz),
+                    "Proof generated".into(),
                     &ws_addr_string,
                     json!({
-                        "proof_duration_sec": duration.as_secs(),
-                        "proof_duration_millis": duration.as_millis(),
-                        "proof_cycles_hertz": proof_cycles_hertz,
-                        "prover_id": prover_id,
+                        "steps_in_trace": total_steps,
+                        "steps_to_prove": steps_to_prove,
+                        "steps_proven": steps_proven,
+                        "cycles_proven": cycles_proved,
+                        "k": k,
+                        "proof_duration_sec": total_duration.as_secs(),
+                        "proof_duration_millis": total_duration.as_millis(),
+                        "proof_cycles_per_minute": proof_cycles_per_minute,
+                        "program_name": program_name,
                     }),
+                    false,
                 );
             }
         }
@@ -329,7 +359,7 @@ async fn main() {
         if args.just_once {
             break;
         } else {
-            println!("Waiting for another program to prove...");
+            println!("\n\nWaiting for a new program to prove...\n");
         }
     }
 
@@ -339,11 +369,29 @@ async fn main() {
             reason: Cow::Borrowed("Finished proving."),
         }))
         .await
-        .unwrap();
+        .map_err(|e| {
+            track(
+                "close_error".into(),
+                "Failed to close WebSocket connection".into(),
+                &ws_addr_string,
+                json!({
+                    "prover_id": &prover_id,
+                    "program_name": utils::prover::get_program_for_prover(&prover_id),
+                    "error": e.to_string(),
+                }),
+                true,
+            );
+            format!("Failed to close WebSocket connection: {}", e)
+        })?;
     track(
         "disconnect".into(),
         "Sent proof and closed connection...".into(),
         &ws_addr_string,
-        json!({ "prover_id": prover_id }),
+        json!({
+            "prover_id": prover_id,
+            "program_name": utils::prover::get_program_for_prover(&prover_id),
+        }),
+        true,
     );
+    Ok(())
 }
