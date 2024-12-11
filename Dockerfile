@@ -11,9 +11,14 @@ RUN apt-get install -y \
     tmux htop nvme-cli pkg-config libssl-dev libleveldb-dev tar clang bsdmainutils \
     ncdu unzip
 
+# Install protobuf dari binary resmi
+RUN curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v23.4/protoc-23.4-linux-x86_64.zip && \
+    unzip protoc-23.4-linux-x86_64.zip -d /usr/local && \
+    rm protoc-23.4-linux-x86_64.zip
+
 # Install Rust
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+ENV PATH="/root/.cargo/bin:/usr/local/bin:${PATH}"
 
 # Siapkan direktori untuk Nexus
 ENV NEXUS_HOME="/root/.nexus"
@@ -29,6 +34,7 @@ WORKDIR ${NEXUS_HOME}/network-api/clients/cli
 # Build dan jalankan aplikasi
 RUN git stash save && git fetch --tags
 RUN git -c advice.detachedHead=false checkout $(git rev-list --tags --max-count=1)
+RUN cargo clean && cargo build --release
 
 # Jalankan aplikasi
 CMD ["cargo", "run", "--release", "--bin", "prover", "--", "beta.orchestrator.nexus.xyz"]
