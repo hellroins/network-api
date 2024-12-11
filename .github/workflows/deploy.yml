@@ -3,7 +3,7 @@ name: DEPLOY TO DOCKER IMAGE
 on:
   push:
     branches:
-      - master
+      - main
 
 jobs:
   build:
