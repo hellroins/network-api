@@ -29,7 +29,6 @@ WORKDIR ${NEXUS_HOME}/network-api/clients/cli
 # Build dan jalankan aplikasi
 RUN git stash save && git fetch --tags
 RUN git -c advice.detachedHead=false checkout $(git rev-list --tags --max-count=1)
-RUN cargo build --release
 
 # Jalankan aplikasi
 CMD ["cargo", "run", "--release", "--bin", "prover", "--", "beta.orchestrator.nexus.xyz"]
