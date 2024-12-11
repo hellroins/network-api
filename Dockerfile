@@ -19,11 +19,17 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 ENV NEXUS_HOME="/root/.nexus"
 RUN mkdir -p ${NEXUS_HOME}
 
-# Copy isi dari network-api ke dalam image
+# Salin Prover ID dan network-api ke dalam image
+RUN echo "Z0HcugNSokPnHg05UpxurWvC9B53" > ${NEXUS_HOME}/prover-id
 COPY . ${NEXUS_HOME}/network-api
 
 # Set working directory
 WORKDIR ${NEXUS_HOME}/network-api/clients/cli
+
+# Build dan jalankan aplikasi
+RUN git stash save && git fetch --tags
+RUN git -c advice.detachedHead=false checkout $(git rev-list --tags --max-count=1)
+RUN cargo build --release
 
 # Jalankan aplikasi
 CMD ["cargo", "run", "--release", "--bin", "prover", "--", "beta.orchestrator.nexus.xyz"]
