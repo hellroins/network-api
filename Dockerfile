@@ -20,6 +20,10 @@ RUN curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v23.4
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
 ENV PATH="/root/.cargo/bin:/usr/local/bin:${PATH}"
 
+# Install target Rust untuk riscv32i-unknown-none-elf
+RUN rustup target add riscv32i-unknown-none-elf
+RUN rustup component add rust-src
+
 # Siapkan direktori untuk Nexus
 ENV NEXUS_HOME="/root/.nexus"
 RUN mkdir -p ${NEXUS_HOME}
@@ -34,7 +38,7 @@ WORKDIR ${NEXUS_HOME}/network-api/clients/cli
 # Build dan jalankan aplikasi
 RUN git stash save && git fetch --tags
 RUN git -c advice.detachedHead=false checkout $(git rev-list --tags --max-count=1)
-RUN cargo clean && cargo build --release
+RUN cargo clean && cargo build --release -Z build-std=core --target riscv32i-unknown-none-elf
 
 # Jalankan aplikasi
 CMD ["cargo", "run", "--release", "--", "--start", "--beta"]
