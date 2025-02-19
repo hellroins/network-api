@@ -9,7 +9,7 @@ RUN apt-get update && apt-get upgrade -y
 RUN apt-get install -y \
     curl iptables build-essential git wget lz4 jq make gcc nano automake autoconf \
     tmux htop nvme-cli pkg-config libssl-dev libleveldb-dev tar clang bsdmainutils \
-    ncdu unzip
+    ncdu unzip lld
 
 # Install protobuf dari binary resmi
 RUN curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v23.4/protoc-23.4-linux-x86_64.zip && \
@@ -21,8 +21,11 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
 ENV PATH="/root/.cargo/bin:/usr/local/bin:${PATH}"
 
 # Install target Rust untuk riscv32i-unknown-none-elf
+RUN rustup default nightly
+RUN rustup update
 RUN rustup target add riscv32i-unknown-none-elf
 RUN rustup component add rust-src
+RUN rustup component add llvm-tools-preview
 
 # Siapkan direktori untuk Nexus
 ENV NEXUS_HOME="/root/.nexus"
@@ -35,9 +38,14 @@ COPY . ${NEXUS_HOME}/network-api
 # Set working directory
 WORKDIR ${NEXUS_HOME}/network-api/clients/cli
 
+# Konfigurasi Cargo untuk target riscv32i
+RUN mkdir -p ${NEXUS_HOME}/network-api/.cargo
+RUN echo -e "[build]\ntarget = \"riscv32i-unknown-none-elf\"\nrustflags = [\"-C\", \"link-arg=-Tlink.x\"]" > ${NEXUS_HOME}/network-api/.cargo/config.toml
+
 # Build dan jalankan aplikasi
 RUN git stash save && git fetch --tags
 RUN git -c advice.detachedHead=false checkout $(git rev-list --tags --max-count=1)
+RUN cargo clean && cargo build --release -Z build-std=core,alloc --target riscv32i-unknown-none-elf
 
 # Jalankan aplikasi
 CMD ["cargo", "run", "--release", "--", "--start", "--beta"]
