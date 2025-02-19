@@ -38,7 +38,6 @@ WORKDIR ${NEXUS_HOME}/network-api/clients/cli
 # Build dan jalankan aplikasi
 RUN git stash save && git fetch --tags
 RUN git -c advice.detachedHead=false checkout $(git rev-list --tags --max-count=1)
-RUN cargo clean && cargo build --release -Z build-std=core --target riscv32i-unknown-none-elf
 
 # Jalankan aplikasi
 CMD ["cargo", "run", "--release", "--", "--start", "--beta"]
