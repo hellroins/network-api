@@ -30,9 +30,6 @@ RUN rustup component add llvm-tools-preview
 # Pastikan Rust source tersedia
 RUN mkdir -p $(rustc --print sysroot)/lib/rustlib/src/rust
 
-# Set Rust flags
-ENV RUSTFLAGS="-C link-arg=-Tlink.x"
-
 # Siapkan direktori untuk Nexus
 ENV NEXUS_HOME="/root/.nexus"
 RUN mkdir -p ${NEXUS_HOME}
@@ -46,9 +43,12 @@ WORKDIR ${NEXUS_HOME}/network-api/clients/cli
 
 # Konfigurasi Cargo untuk target riscv32i
 RUN mkdir -p ${NEXUS_HOME}/network-api/.cargo && \
-    echo "[build]" > ${NEXUS_HOME}/network-api/.cargo/config.toml && \
-    echo "target = \"riscv32i-unknown-none-elf\"" >> ${NEXUS_HOME}/network-api/.cargo/config.toml && \
-    echo "rustflags = [\"-C\", \"link-arg=-Tlink.x\"]" >> ${NEXUS_HOME}/network-api/.cargo/config.toml
+    echo '[build]' > ${NEXUS_HOME}/network-api/.cargo/config.toml && \
+    echo 'target = "riscv32i-unknown-none-elf"' >> ${NEXUS_HOME}/network-api/.cargo/config.toml && \
+    echo 'rustflags = ["-C", "link-arg=-Tlink.x"]' >> ${NEXUS_HOME}/network-api/.cargo/config.toml
+
+# Pastikan Rust source tersedia untuk toolchain yang digunakan
+RUN rustup show active-toolchain | cut -d' ' -f1 | xargs -I {} rustup component add rust-src --toolchain {}
 
 # Build dan jalankan aplikasi
 RUN git stash save && git fetch --tags
