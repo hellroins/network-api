@@ -26,6 +26,7 @@ RUN rustup update
 RUN rustup target add riscv32i-unknown-none-elf
 RUN rustup component add rust-src
 RUN rustup component add llvm-tools-preview
+RUN mkdir -p /root/.rustup/toolchains/nightly-$(rustc --version | cut -d' ' -f2)-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library
 
 # Siapkan direktori untuk Nexus
 ENV NEXUS_HOME="/root/.nexus"
