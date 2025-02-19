@@ -24,9 +24,14 @@ ENV PATH="/root/.cargo/bin:/usr/local/bin:${PATH}"
 RUN rustup default nightly
 RUN rustup update
 RUN rustup target add riscv32i-unknown-none-elf
-RUN rustup component add rust-src
+RUN rustup component add rust-src --toolchain nightly
 RUN rustup component add llvm-tools-preview
-RUN mkdir -p /root/.rustup/toolchains/nightly-$(rustc --version | cut -d' ' -f2)-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library
+
+# Pastikan Rust source tersedia
+RUN mkdir -p $(rustc --print sysroot)/lib/rustlib/src/rust
+
+# Set Rust flags
+ENV RUSTFLAGS="-C link-arg=-Tlink.x"
 
 # Siapkan direktori untuk Nexus
 ENV NEXUS_HOME="/root/.nexus"
