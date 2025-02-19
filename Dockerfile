@@ -37,4 +37,4 @@ RUN git -c advice.detachedHead=false checkout $(git rev-list --tags --max-count=
 RUN cargo clean && cargo build --release
 
 # Jalankan aplikasi
-CMD ["cargo", "run", "--release", "--bin", "prover", "--", "beta.orchestrator.nexus.xyz"]
+CMD ["cargo", "run", "--release", "--", "--start", "--beta"]
