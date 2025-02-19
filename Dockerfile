@@ -39,8 +39,10 @@ COPY . ${NEXUS_HOME}/network-api
 WORKDIR ${NEXUS_HOME}/network-api/clients/cli
 
 # Konfigurasi Cargo untuk target riscv32i
-RUN mkdir -p ${NEXUS_HOME}/network-api/.cargo
-RUN echo -e "[build]\ntarget = \"riscv32i-unknown-none-elf\"\nrustflags = [\"-C\", \"link-arg=-Tlink.x\"]" > ${NEXUS_HOME}/network-api/.cargo/config.toml
+RUN mkdir -p ${NEXUS_HOME}/network-api/.cargo && \
+    echo "[build]" > ${NEXUS_HOME}/network-api/.cargo/config.toml && \
+    echo "target = \"riscv32i-unknown-none-elf\"" >> ${NEXUS_HOME}/network-api/.cargo/config.toml && \
+    echo "rustflags = [\"-C\", \"link-arg=-Tlink.x\"]" >> ${NEXUS_HOME}/network-api/.cargo/config.toml
 
 # Build dan jalankan aplikasi
 RUN git stash save && git fetch --tags
